@@ -1,6 +1,6 @@
 /******************************************************************************
  *
- *  Copyright 2015-2021 NXP
+ *  Copyright (C) 2015 NXP Semiconductors
  *
  *  Licensed under the Apache License, Version 2.0 (the "License")
  *  you may not use this file except in compliance with the License.
@@ -19,8 +19,14 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <string.h>
+#include <netdb.h> 
+#include <netinet/in.h> 
+#include <sys/socket.h> 
+#include <sys/types.h> 
+#include <unistd.h> // read(), write(), close()
 #include "linux_nfc_api.h"
 #include "tools.h"
+#define SA struct sockaddr
 typedef enum eDevState
 {
     eDevState_NONE,
@@ -90,6 +96,10 @@ static T4T_NDEF_EMU_Callback_t *pT4T_NDEF_EMU_PushCb = NULL;
 void help(int mode);
 int InitEnv();
 int LookForTag(char** args, int args_len, char* tag, char** data, int format);
+
+// ETES Socket to forward ndef info
+int sockfd, connfd, len;
+struct sockaddr_in servaddr, cli;
 /********************************** HCE **********************************/
 static void T4T_NDEF_EMU_FillRsp (unsigned char *pRsp, unsigned short offset, unsigned char length)
 {
@@ -587,7 +597,6 @@ int InitMode(int tag, int p2p, int hce)
 {
     int res = 0x00;
     
-    InitializeLogLevel();
     g_TagCB.onTagArrival = onTagArrival;
     g_TagCB.onTagDeparture = onTagDeparture;
         
@@ -604,7 +613,7 @@ int InitMode(int tag, int p2p, int hce)
     
     if(0x00 == res)
     {
-        res = doInitialize();
+        res = nfcManager_doInitialize();
         if(0x00 != res)
         {
             printf("NfcService Init Failed\n");
@@ -615,9 +624,9 @@ int InitMode(int tag, int p2p, int hce)
     {
         if(0x01 == tag)
         {
-            registerTagCallback(&g_TagCB);
+            nfcManager_registerTagCallback(&g_TagCB);
         }
-#ifdef SNEP_ENABLED
+        
         if(0x01 == p2p)
         {
             res = nfcSnep_registerClientCallback(&g_SnepClientCB);
@@ -626,7 +635,6 @@ int InitMode(int tag, int p2p, int hce)
                 printf("SNEP Client Register Callback Failed\n");
             }
         }
-#endif
     }
     
     if(0x00 == res && 0x01 == hce)
@@ -635,16 +643,14 @@ int InitMode(int tag, int p2p, int hce)
     }
     if(0x00 == res)
     {
-        doEnableDiscovery(DEFAULT_NFA_TECH_MASK, 0x00, hce, 0);
+        nfcManager_enableDiscovery(DEFAULT_NFA_TECH_MASK, 0x00, hce, 0);
         if(0x01 == p2p)
         {
-#ifdef SNEP_ENABLED
             res = nfcSnep_startServer(&g_SnepServerCB);
             if(0x00 != res)
             {
                 printf("Start SNEP Server Failed\n");
             }
-#endif
         }
     }
     
@@ -654,10 +660,12 @@ int InitMode(int tag, int p2p, int hce)
 void DeinitPollMode()
 {
     nfcSnep_stopServer();
-    disableDiscovery();
+    
+    nfcManager_disableDiscovery();
     
     nfcSnep_deregisterClientCallback();
-    deregisterTagCallback();
+    
+    nfcManager_deregisterTagCallback();
     
     nfcHce_deregisterHceCallback();
     
@@ -686,6 +694,7 @@ int SnepPush(unsigned char* msgToPush, unsigned int len)
     {
         framework_UnlockMutex(g_SnepClientLock);
         res = nfcSnep_putMessage(msgToPush, len);
+        
         if(0x00 != res)
         {
             printf("\t\tPush Failed\n");
@@ -771,7 +780,6 @@ void PrintNDEFContent(nfc_tag_info_t* TagInfo, ndef_info_t* NDEFinfo, unsigned c
     {
         ndefRawLen = NDEFinfo->current_ndef_length;
         NDEFContent = malloc(ndefRawLen * sizeof(unsigned char));
-        memset(NDEFContent,0x0,ndefRawLen * sizeof(unsigned char));
         res = nfcTag_readNdef(TagInfo->handle, NDEFContent, ndefRawLen, &lNDEFType);
     }
     else if (NULL != ndefRaw && 0x00 != ndefRawLen)
@@ -1125,6 +1133,7 @@ void PrintNDEFContent(nfc_tag_info_t* TagInfo, ndef_info_t* NDEFinfo, unsigned c
             {
             } break;
         }
+        printf("Data will be sent\n");
         printf("\n\t\t%d bytes of NDEF data received :\n\t\t", ndefRawLen);
         for(i = 0x00; i < ndefRawLen; i++)
         {
@@ -1135,6 +1144,8 @@ void PrintNDEFContent(nfc_tag_info_t* TagInfo, ndef_info_t* NDEFinfo, unsigned c
             }
         }
         printf("\n\n");
+        send(connfd, NDEFContent, ndefRawLen, 0);
+        printf("Written NDEF Records\n");
     }
     
     if(NULL != NDEFContent)
@@ -1156,20 +1167,19 @@ int WaitDeviceArrival(int mode, unsigned char* msgToSend, unsigned int len)
     unsigned char MifareAuthCmd[] = {0x60U, 0x00 /*block*/, 0x02, 0x02, 0x02, 0x02, 0x00 /*key*/, 0x00 /*key*/, 0x00 /*key*/, 0x00 /*key*/ , 0x00 /*key*/, 0x00 /*key*/};
     unsigned char MifareAuthResp[255];
     unsigned char MifareReadCmd[] = {0x30U,  /*block*/ 0x00};
-    unsigned char MifareWriteCmd[] = {0xA0U,  /*block*/ 0x00, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55, 0xAA, 0x55};
+    unsigned char MifareWriteCmd[] = {0xA2U,  /*block*/ 0x04, 0xFF, 0xFF, 0xFF, 0xFF};
     unsigned char MifareResp[255];
-
+    
     unsigned char HCEReponse[255];
     short unsigned int HCEResponseLen = 0x00;
     int tag_count=0;
     int num_tags = 0;
-
+    
     nfc_tag_info_t TagInfo;
-
+    
     MifareAuthCmd[1] = block;
     memcpy(&MifareAuthCmd[6], key, 6);
     MifareReadCmd[1] = block;
-    MifareWriteCmd[1] = block;
     
     do
     {
@@ -1287,7 +1297,7 @@ int WaitDeviceArrival(int mode, unsigned char* msgToSend, unsigned int len)
                 else
                 {
                     printf("\t\tNDEF Content : NO, mode=%d, tech=%d\n", mode, TagInfo.technology);
-
+                    
                     if(0x03 == mode)
                     {
                          printf("\n\tFormating tag to NDEF prior to write ...\n");
@@ -1324,7 +1334,7 @@ int WaitDeviceArrival(int mode, unsigned char* msgToSend, unsigned int len)
                                 printf("%02X ", MifareAuthResp[i]);
                             }
                             printf("\n");
-
+                            
                             res = nfcTag_transceive(TagInfo.handle, MifareReadCmd, 2, MifareResp, 255, 500);
                             if(0x00 == res)
                             {
@@ -1338,21 +1348,6 @@ int WaitDeviceArrival(int mode, unsigned char* msgToSend, unsigned int len)
                                     printf("%02X ", MifareResp[i]);
                                 }
                                 printf("\n\n");
-
-                                res = nfcTag_transceive(TagInfo.handle, MifareWriteCmd, sizeof(MifareWriteCmd), MifareResp, 255, 500);
-                                if(0x00 == res)
-                                {
-                                    printf("\n\t\tRAW Tag transceive failed\n");
-                                }
-                                else
-                                {
-                                    printf("\n\t\tMifare Write command sent\n\t\tResponse : \n\t\t");
-                                    for(i = 0x00; i < (unsigned int)res; i++)
-                                    {
-                                        printf("%02X ", MifareResp[i]);
-                                    }
-                                    printf("\n\n");
-                                }
                             }
                         }
                     }
@@ -1403,14 +1398,14 @@ int WaitDeviceArrival(int mode, unsigned char* msgToSend, unsigned int len)
                         printf("\tWrite Tag Failed\n");
                     }
                 }
-                num_tags = getNumTags();
+                num_tags = nfcManager_getNumTags();
                 if(num_tags > 1)
                 {
                     tag_count++;
                     if (tag_count < num_tags)
                     {
                         printf("\tMultiple tags found, selecting next tag...\n");
-                        selectNextTag();
+                        nfcManager_selectNextTag();
                     }
                     else
                     {
@@ -1891,151 +1886,12 @@ void cmd_poll(int arg_len, char** arg)
     
     printf("Leaving ...\n");
 }
- 
-void cmd_push(int arg_len, char** arg)
-{
-    int res = 0x00;
-    unsigned char * NDEFMsg = NULL;
-    unsigned int NDEFMsgLen = 0x00;
-    
-    printf("#########################################################################################\n");
-    printf("##                                       NFC demo                                      ##\n");
-    printf("#########################################################################################\n");
-    printf("##                                 Push mode activated                                 ##\n");
-    printf("#########################################################################################\n");
-    
-    InitEnv();
-    
-    if(0x00 == LookForTag(arg, arg_len, "-h", NULL, 0x00) || 0x00 == LookForTag(arg, arg_len, "--help", NULL, 0x01))
-    {
-        help(0x02);
-    }
-    else
-    {
-        res = InitMode(0x01, 0x01, 0x00);
-        
-        if(0x00 == res)
-        {
-            res = BuildNDEFMessage(arg_len, arg, &NDEFMsg, &NDEFMsgLen);
-        }
-        
-        if(0x00 == res)
-        {
-            WaitDeviceArrival(0x02, NDEFMsg, NDEFMsgLen);
-        }
-        
-        if(NULL != NDEFMsg)
-        {
-            free(NDEFMsg);
-            NDEFMsg = NULL;
-            NDEFMsgLen = 0x00;
-        }
-        
-        DeinitPollMode();
-    }
-    
-    printf("Leaving ...\n");
-}
-
-void cmd_share(int arg_len, char** arg)
-{
-    int res = 0x00;
-    unsigned char * NDEFMsg = NULL;
-    unsigned int NDEFMsgLen = 0x00;
-    
-    printf("#########################################################################################\n");
-    printf("##                                       NFC demo                                      ##\n");
-    printf("#########################################################################################\n");
-    printf("##                                 Share mode activated                                ##\n");
-    printf("#########################################################################################\n");
-    
-    InitEnv();
-    
-    if(0x00 == LookForTag(arg, arg_len, "-h", NULL, 0x00) || 0x00 == LookForTag(arg, arg_len, "--help", NULL, 0x01))
-    {
-        help(0x02);
-    }
-    else
-    {
-        res = InitMode(0x00, 0x00, 0x01);
-        
-        if(0x00 == res)
-        {
-            res = BuildNDEFMessage(arg_len, arg, &NDEFMsg, &NDEFMsgLen);
-        }
-        
-        if(0x00 == res)
-        {
-            T4T_NDEF_EMU_SetRecord(NDEFMsg, NDEFMsgLen, NULL);
-        }
-        
-        if(0x00 == res)
-        {
-            WaitDeviceArrival(0x04, NDEFMsg, NDEFMsgLen);
-        }
-        
-        if(NULL != NDEFMsg)
-        {
-            free(NDEFMsg);
-            NDEFMsg = NULL;
-            NDEFMsgLen = 0x00;
-        }
-        
-        DeinitPollMode();
-    }
-    
-    printf("Leaving ...\n");
-}
-void cmd_write(int arg_len, char** arg)
-{
-    int res = 0x00;
-    unsigned char * NDEFMsg = NULL;
-    unsigned int NDEFMsgLen = 0x00;
-    
-    printf("#########################################################################################\n");
-    printf("##                                       NFC demo                                      ##\n");
-    printf("#########################################################################################\n");
-    printf("##                                 Write mode activated                                ##\n");
-    printf("#########################################################################################\n");
-    
-    InitEnv();
-    
-    if(0x00 == LookForTag(arg, arg_len, "-h", NULL, 0x00) || 0x00 == LookForTag(arg, arg_len, "--help", NULL, 0x01))
-    {
-        help(0x02);
-    }
-    else
-    {
-        res = InitMode(0x01, 0x01, 0x00);
-        
-        if(0x00 == res)
-        {
-            res = BuildNDEFMessage(arg_len, arg, &NDEFMsg, &NDEFMsgLen);
-        }
-        
-        if(0x00 == res)
-        {
-            WaitDeviceArrival(0x03, NDEFMsg, NDEFMsgLen);
-        }
-        
-        if(NULL != NDEFMsg)
-        {
-            free(NDEFMsg);
-            NDEFMsg = NULL;
-            NDEFMsgLen = 0x00;
-        }
-        
-        DeinitPollMode();
-    }
-    
-    printf("Leaving ...\n");
-}
 
 void* ExitThread(void* pContext)
 {
     printf("                              ... press enter to quit ...\n\n");
     
-    getchar();
+    //getchar();
     
     framework_LockMutex(g_SnepClientLock);
     
@@ -2094,14 +1950,14 @@ int InitEnv()
             res = 0xFF;
         }
      }
-     if(0x00 == res)
-    {
-        tool_res = framework_CreateThread(&g_ThreadHandle, ExitThread, NULL);
-        if(FRAMEWORK_SUCCESS != tool_res)
-        {
-            res = 0xFF;
-        }
-    }
+//     if(0x00 == res)
+//    {
+//        tool_res = framework_CreateThread(&g_ThreadHandle, ExitThread, NULL);
+//        if(FRAMEWORK_SUCCESS != tool_res)
+//        {
+//            res = 0xFF;
+//        }
+//    }
     return res;
 }
 
@@ -2135,30 +1991,53 @@ int CleanEnv()
  
 int main(int argc, char ** argv)
 {
-    if (argc<2)
-    {
-        printf("Missing argument\n");
-        help(0x00);
+    
+    // socket create and verification
+    sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd == -1) {
+        printf("socket creation failed...\n");
+        exit(0);
     }
-    else if (strcmp(argv[1],"poll") == 0)
-    {
+    else {
+        printf("Socket successfully created..\n");
+    }
+    bzero(&servaddr, sizeof(servaddr));
+
+    // assign IP, PORT
+    servaddr.sin_family = AF_INET;
+    servaddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    servaddr.sin_port = htons(4353);
+
+    // Binding newly created socket to given IP and verification 
+    if ((bind(sockfd, (SA*)&servaddr, sizeof(servaddr))) != 0) { 
+        printf("socket bind failed...\n"); 
+        exit(0); 
+    } 
+    else {
+        printf("Socket successfully binded..\n");
+    }
+
+    // Now server is ready to listen and verification 
+    if ((listen(sockfd, 5)) != 0) { 
+        printf("Listen failed...\n"); 
+        exit(0); 
+    } 
+    else {
+        printf("Server listening..\n");
+    }
+    len = sizeof(cli); 
+
+    // Accept the data packet from client and verification 
+    connfd = accept(sockfd, (SA*)&cli, &len); 
+    if (connfd < 0) { 
+        printf("server accept failed...\n"); 
+        exit(0); 
+    } 
+    else {
+        printf("server accept the client...\n");
+        printf("Polling\n");
         cmd_poll(argc - 2, &argv[2]);
-    }
-    else if(strcmp(argv[1],"write") == 0)
-    {
-        cmd_write(argc - 2, &argv[2]);
-    }
-    else if(strcmp(argv[1],"push") == 0)
-    {
-        cmd_push(argc - 2, &argv[2]);
-    }
-    else if(strcmp(argv[1],"share") == 0)
-    {
-        cmd_share(argc - 2, &argv[2]);
-    }
-    else
-    {
-        help(0x00);
+        close(connfd);
     }
     printf("\n");
     
